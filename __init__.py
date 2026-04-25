@@ -9,7 +9,7 @@ from mathutils import Vector
 bl_info = {
     "name": "Subject Lighting Rig",
     "author": "",
-    "version": (1, 4, 0),
+    "version": (1, 0, 1),
     "blender": (3, 0, 0),
     "location": "View3D > N-panel > Subject Lights",
     "description": "Add and edit a front point light plus two aimed 45-degree back area lights",
@@ -33,14 +33,36 @@ def get_subject_center(obj) -> Vector:
     return obj.matrix_world.translation.copy()
 
 
-def world_radius_for_offset(obj) -> float:
-    """Approximate size for default light distance."""
+# Clearance added past the subject's outer surface so lights never start inside the mesh
+_RIG_OUTSIDE_MARGIN = 1.0
+_RIG_MIN_HALF = 0.5
+
+
+def subject_light_offset_radius(obj) -> float:
+    """
+    World-space distance from the subject's bounds center to its outermost point,
+    plus a margin. Uses BOTH the bound-box corner distance and obj.dimensions so
+    we never under-shoot for objects with offset geometry or unusual bounds.
+    """
+    half = _RIG_MIN_HALF
+
     if obj.type == "MESH" and obj.data:
-        corners = [Vector(c) for c in obj.bound_box]
-        radius = max((corner.length for corner in corners), default=1.0)
-        scale = max(obj.scale.x, obj.scale.y, obj.scale.z)
-        return max(0.5, radius * scale)
-    return 2.0
+        center = get_subject_center(obj)
+        try:
+            corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+            if corners:
+                half = max(half, max((c - center).length for c in corners))
+        except Exception:
+            pass
+
+    try:
+        d = obj.dimensions
+        if d.length > 1e-8:
+            half = max(half, 0.5 * max(d.x, d.y, d.z))
+    except Exception:
+        pass
+
+    return half + _RIG_OUTSIDE_MARGIN
 
 
 def ensure_collection(context, name: str):
@@ -60,24 +82,35 @@ def link_to_collection_only(obj, collection):
 
 
 def parent_keep_world(child, parent):
-    """Parent child to parent while preserving world transform."""
+    """
+    Parent child to parent while keeping the child's current world transform.
+    Forces a depsgraph update first so just-set locations are reflected in matrix_world.
+    """
     if child is None or parent is None:
         return
     if child.parent is parent:
         return
-    matrix_world = child.matrix_world.copy()
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    saved_world = child.matrix_world.copy()
     child.parent = parent
     child.matrix_parent_inverse = parent.matrix_world.inverted()
-    child.matrix_world = matrix_world
+    child.matrix_world = saved_world
 
 
 def clear_parent_keep_world(child):
     if child is None or child.parent is None:
         return
-    matrix_world = child.matrix_world.copy()
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    saved_world = child.matrix_world.copy()
     child.parent = None
     child.matrix_parent_inverse.identity()
-    child.matrix_world = matrix_world
+    child.matrix_world = saved_world
 
 
 def set_world_location(obj, location):
@@ -90,8 +123,12 @@ def apply_color(light_data, color):
     light_data.color = (color[0], color[1], color[2])
 
 
-def rig_vector_offsets(subject, distance_scale):
-    radius = world_radius_for_offset(subject) * distance_scale
+# Fixed multiplier of subject_light_offset_radius for the default rig spread
+RIG_DISTANCE_MULTIPLIER = 3.0
+
+
+def rig_vector_offsets(subject):
+    radius = subject_light_offset_radius(subject) * RIG_DISTANCE_MULTIPLIER
     half = math.sqrt(0.5)
     return {
         "front": Vector((0.0, -1.0, 0.0)) * radius,
@@ -149,25 +186,6 @@ def remove_track_constraint(light_obj):
         light_obj.constraints.remove(constraint)
 
 
-def bake_rotation_toward(light_obj, world_target: Vector):
-    """Rotate light so its local -Z points at world_target. Used when no target empty exists."""
-    if not light_obj:
-        return
-    direction = world_target - light_obj.matrix_world.translation
-    if direction.length < 1e-7:
-        return
-    quat = direction.to_track_quat("-Z", "Y")
-    light_obj.rotation_mode = "QUATERNION"
-    light_obj.rotation_quaternion = quat
-
-
-def remove_target_empty(settings):
-    target = get_pointer_or_named(settings, "target", TARGET_NAME)
-    if target:
-        bpy.data.objects.remove(target, do_unlink=True)
-    settings.target = None
-
-
 def cleanup_existing_rig(settings):
     names = (FRONT_NAME, BACK_LEFT_NAME, BACK_RIGHT_NAME, TARGET_NAME, ROOT_NAME)
     attrs = ("front_light", "back_left_light", "back_right_light", "target", "root")
@@ -190,77 +208,17 @@ def sync_target_to_subject(settings):
         set_world_location(target, get_subject_center(subject))
 
 
-def scale_lights_from_subject(settings, ratio):
-    """Scale each light's offset from the subject center by ratio.
-
-    Preserves the current direction of each light so manual moves (e.g. raised
-    overhead lights) stay in place when only the distance scale changes.
-    """
-    subject = settings.subject
-    if not subject or ratio <= 0 or abs(ratio - 1.0) < 1e-9:
-        return
-    center = get_subject_center(subject)
-    for attr, name in (
-        ("front_light", FRONT_NAME),
-        ("back_left_light", BACK_LEFT_NAME),
-        ("back_right_light", BACK_RIGHT_NAME),
-    ):
-        light = get_pointer_or_named(settings, attr, name)
-        if not light:
-            continue
-        current = light.matrix_world.translation.copy()
-        offset = current - center
-        if offset.length < 1e-7:
-            continue
-        set_world_location(light, center + offset * ratio)
-
-
-def update_distance(self, context):
-    new_scale = self.light_distance
-    old_scale = self.last_distance_scale
-    if old_scale <= 0:
-        old_scale = new_scale
-    ratio = new_scale / old_scale if old_scale > 0 else 1.0
-    scale_lights_from_subject(self, ratio)
-    sync_target_to_subject(self)
-    self.last_distance_scale = new_scale
-
-
 def update_parenting(self, context):
+    """Toggling Parent-to-subject only changes whether the rig root follows the subject."""
     root = get_pointer_or_named(self, "root", ROOT_NAME)
     subject = self.subject
     if not root:
         return
 
-    left = get_pointer_or_named(self, "back_left_light", BACK_LEFT_NAME)
-    right = get_pointer_or_named(self, "back_right_light", BACK_RIGHT_NAME)
-    collection = ensure_collection(context, COLLECTION_NAME)
-    center = get_subject_center(subject) if subject else root.matrix_world.translation
-
     if self.parent_to_subject and subject:
         parent_keep_world(root, subject)
-        target = get_pointer_or_named(self, "target", TARGET_NAME)
-        if target is None:
-            target = bpy.data.objects.new(TARGET_NAME, None)
-            target.empty_display_type = "SPHERE"
-            target.empty_display_size = max(0.2, world_radius_for_offset(subject) * 0.12)
-            collection.objects.link(target)
-            self.target = target
-        set_world_location(target, center)
-        parent_keep_world(target, root)
-        if left:
-            add_track_to_subject(left, target)
-        if right:
-            add_track_to_subject(right, target)
     else:
         clear_parent_keep_world(root)
-        if left:
-            remove_track_constraint(left)
-            bake_rotation_toward(left, center)
-        if right:
-            remove_track_constraint(right)
-            bake_rotation_toward(right, center)
-        remove_target_empty(self)
 
 
 def set_light_defaults(settings, preset):
@@ -330,29 +288,30 @@ class SUBJECT_RIG_OT_add_lights(bpy.types.Operator):
 
         collection = ensure_collection(context, COLLECTION_NAME)
         center = get_subject_center(subject)
-        offsets = rig_vector_offsets(subject, settings.light_distance)
+        radius = subject_light_offset_radius(subject)
+        offsets = rig_vector_offsets(subject)
 
         cleanup_existing_rig(settings)
 
+        # Always-present root for organization + optional follow
         root = bpy.data.objects.new(ROOT_NAME, None)
         root.empty_display_type = "PLAIN_AXES"
-        root.empty_display_size = max(0.35, world_radius_for_offset(subject) * 0.2)
-        root.location = center
+        root.empty_display_size = max(0.35, radius * 0.2)
         collection.objects.link(root)
+        root.location = center
 
-        target = None
-        if settings.parent_to_subject:
-            target = bpy.data.objects.new(TARGET_NAME, None)
-            target.empty_display_type = "SPHERE"
-            target.empty_display_size = max(0.2, world_radius_for_offset(subject) * 0.12)
-            target.location = center
-            collection.objects.link(target)
+        # Always-present target empty so area lights can Track To it
+        target = bpy.data.objects.new(TARGET_NAME, None)
+        target.empty_display_type = "SPHERE"
+        target.empty_display_size = max(0.2, radius * 0.12)
+        collection.objects.link(target)
+        target.location = center
 
-        def new_light(name, light_type, location):
+        def new_light(name, light_type, world_location):
             light_data = bpy.data.lights.new(name, type=light_type)
             light_obj = bpy.data.objects.new(name, light_data)
-            light_obj.location = location
             collection.objects.link(light_obj)
+            light_obj.location = world_location
             return light_obj
 
         front = new_light(FRONT_NAME, "POINT", center + offsets["front"])
@@ -369,19 +328,18 @@ class SUBJECT_RIG_OT_add_lights(bpy.types.Operator):
         right.data.size = settings.area_size
         apply_color(right.data, settings.color_area_right)
 
-        if target is not None:
-            add_track_to_subject(left, target)
-            add_track_to_subject(right, target)
-        else:
-            bake_rotation_toward(left, center)
-            bake_rotation_toward(right, center)
+        # Make Blender flush the just-set locations into matrix_world
+        context.view_layer.update()
 
-        rig_children = [front, left, right]
-        if target is not None:
-            rig_children.insert(0, target)
-        for obj in rig_children:
+        # Track To target so area lights always face the subject
+        add_track_to_subject(left, target)
+        add_track_to_subject(right, target)
+
+        # Group everything under the rig root, preserving world transforms
+        for obj in (target, front, left, right):
             parent_keep_world(obj, root)
 
+        # Optional: have the rig follow the subject
         if settings.parent_to_subject:
             parent_keep_world(root, subject)
 
@@ -395,6 +353,10 @@ class SUBJECT_RIG_OT_add_lights(bpy.types.Operator):
         for obj in (front, left, right):
             obj.select_set(True)
         context.view_layer.objects.active = front
+        self.report(
+            {"INFO"},
+            f"Lights placed at radius {radius * RIG_DISTANCE_MULTIPLIER:.2f} (subject half {radius - _RIG_OUTSIDE_MARGIN:.2f})",
+        )
         return {"FINISHED"}
 
 
@@ -481,12 +443,11 @@ class SUBJECT_RIG_PT_panel(bpy.types.Panel):
         layout.separator()
         col = layout.column(align=True)
         col.label(text="Rig")
-        col.prop(settings, "light_distance", text="Distance scale")
         col.prop(settings, "parent_to_subject", text="Parent to subject")
         if settings.parent_to_subject:
-            col.label(text="Target empty added so lights track the subject", icon="INFO")
+            col.label(text="Rig follows subject; lights still aim via target", icon="INFO")
         else:
-            col.label(text="No target empty; lights face subject from fixed pose", icon="INFO")
+            col.label(text="Lights stay in world but aim at the target empty", icon="INFO")
 
 
 class SubjectRigSettings(bpy.types.PropertyGroup):
@@ -517,14 +478,6 @@ class SubjectRigSettings(bpy.types.PropertyGroup):
         default=(1.0, 1.0, 1.0),
         min=0.0,
         max=1.0,
-    )
-    light_distance: bpy.props.FloatProperty(
-        name="Distance",
-        default=2.0,
-        min=0.1,
-        max=100.0,
-        description="Multiple of the subject size for light placement",
-        update=update_distance,
     )
     energy_point: bpy.props.FloatProperty(
         name="Point power",
