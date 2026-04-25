@@ -8,7 +8,7 @@ from mathutils import Vector
 
 bl_info = {
     "name": "Subject Lighting Rig",
-    "author": "",
+    "author": "sebby",
     "version": (1, 0, 1),
     "blender": (3, 0, 0),
     "location": "View3D > N-panel > Subject Lights",
